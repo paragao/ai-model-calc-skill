@@ -83,7 +83,7 @@ Users can provide architecture details manually (layers, hidden dim, FFN dim, he
 - **Validate**: All required fields populated (layers, d, q_heads, kv_heads, dense_ffn, expert_ffn, total_params_B, active_params_B, dense_layers, attn_per_layer, expert_each, shared_each, router_each, moe_layer_params, dense_layer_params, valid_pp)
 - **On failure**: If model not in catalog, ask user for custom architecture parameters
 
-For pre-defined models, use the variant dicts from the Model Catalog section below. For custom models, gather: name, layers, d, q_heads, kv_heads, head_dim, dense_ffn, total_params_B, active_params_B, expert_ffn, dense_layers. Then compute derived fields:
+For pre-defined models, use the variant dicts from the Model Catalog section below. For custom models, gather: name, layers, d, q_heads, kv_heads, head_dim, dense_ffn, total_params_B, active_params_B, expert_ffn, dense_layers, and optionally seq_len (per-variant context length; defaults to the global SEQ_LEN). Then compute derived fields:
 - `attn_per_layer = 2 * d * (q_heads + kv_heads) * head_dim`
 - `expert_each = d * expert_ffn * 3`
 - `shared_each = d * shared_expert_ffn * 3` (if shared experts) or `0`
@@ -215,10 +215,17 @@ frequency and therefore convergence/perplexity), so Phase 3 **sweeps** the full
 Each (variant, hardware) uses the **single best-fit ZeRO stage** from Phase 1.
 
 Per (micro, accum) config:
-- `gbs = dp * micro * accum` (global batch in sequences), `tokens_per_batch = gbs * SEQ_LEN`
+- `seq_len = variant.seq_len` (per-variant; defaults to the global `SEQ_LEN`).
+  Used everywhere for this variant — memory, buffers, comm, tokens/batch — AND
+  in the attention-FLOPs term below.
+- `gbs = dp * micro * accum` (global batch in sequences), `tokens_per_batch = gbs * seq_len`
   (skip if `> MAX_TOKENS_PER_BATCH`), `steps = TOTAL_TOKENS / tokens_per_batch`
-- Ideal compute: `flops_per_token = 6 * active_params_B * 1e9`;
-  `compute_seconds = (flops_per_token * TOTAL_TOKENS) / (gpus * peak_tflops * MFU * zero_eff * 1e12)`
+- Ideal compute: `total_flops = 6 * active_params_B * 1e9 * TOTAL_TOKENS + ATTENTION_FLOPS_FACTOR * layers * seq_len * TOTAL_TOKENS * d`.
+  The first term is the linear-in-tokens `6ND`; the second is the O(seq_len²)
+  attention (QKᵀ + softmax·V) matmuls that `6ND` omits. It is linear in seq_len
+  at fixed total tokens, so a 32K-context run estimates a longer time than a 4K
+  run for the same token budget. `ATTENTION_FLOPS_FACTOR=12` (fwd≈4 ×3 fwd/bwd;
+  0 disables). `compute_seconds = total_flops / (gpus * peak_tflops * MFU * zero_eff * 1e12)`
 - **PP bubble** (idle pipeline) inflates compute: `bubble_seconds = compute_seconds * bf/(1-bf)`,
   where `bf = (PP-1)/effective_microbatches` (0 when PP=1). Larger accum → more
   micro-batches → smaller bubble.
