@@ -1,7 +1,15 @@
 """
 AI Model Training Calculator - Self-contained implementation.
-Implements all 5 phases of the LLM training infrastructure calculator.
+Implements all 6 phases of the LLM training infrastructure calculator.
 No external dependencies, no subprocess, no git clone required.
+
+Phases:
+  1. Memory Analysis (MoE-aware with VP activation overhead)
+  2. Batch Configuration
+  3. Training Time
+  4. ZeRO Communication Overhead
+  5. MoE All-to-All Communication
+  6. PP SendRecv Communication (NEW)
 """
 import math
 import csv
@@ -28,7 +36,9 @@ ADVANCED_DEFAULTS = {
     "EMPIRICAL_ACT_MULTIPLIER": 12,
     "SELECTIVE_ACT_CHECKPOINTING_MULTIPLIER": 0.45,
     "FWD_BWD_ROUTING_BUFF_PASSES": 2,
-    "NCCL_MEM_BUF": 4.0,
+    "NCCL_MEM_BUF": 6.0,
+    "NCCL_EP_SCALING_FACTOR": 1.0,
+    "FRAGMENTATION_FACTOR": 1.24,
     "GPU_MEM_UTILIZATION_THRESHOLD": 0.92,
     "LOWER_BOUND_OPTIM_RANGE": 300_000,
     "UPPER_BOUND_OPTIM_RANGE": 800_000,
@@ -41,6 +51,7 @@ ADVANCED_DEFAULTS = {
     "MAX_TOKENS_PER_BATCH": 600e6,
     "TIME_ESTIMATE_LOW_MULTIPLIER": 0.75,
     "TIME_ESTIMATE_HIGH_MULTIPLIER": 1.25,
+    "EFA_PP_EFFICIENCY": 0.016,
 }
 
 
@@ -50,14 +61,38 @@ def get_param_bytes(precision):
 
 
 # ============================================================================
-# PHASE 1: Memory Analysis
+# PHASE 1: Memory Analysis (with MoE fixes + VP activation overhead)
 # ============================================================================
 
+def calculate_model_memory_gb(variant, layers_per_gpu, experts_per_gpu, param_bytes,
+                              vocab, tp=1):
+    """Calculate model memory in GB using the improved MoE-aware formula."""
+    d = variant["d"]
+    layers = variant["layers"]
+    moe_layers = layers - variant.get("dense_layers", layers)
+
+    # Distribute MoE layers proportionally
+    moe_layers_per_gpu = int(layers_per_gpu * moe_layers / layers) if layers > 0 and moe_layers > 0 else 0
+
+    attn_mem = layers_per_gpu * variant["attn_per_layer"] * param_bytes
+    routed_mem = experts_per_gpu * moe_layers_per_gpu * variant["expert_each"] * param_bytes
+    shared_mem = moe_layers_per_gpu * variant.get("shared_each", 0) * param_bytes
+    router_mem = moe_layers_per_gpu * variant.get("router_each", 0) * param_bytes
+    ln_mem = layers_per_gpu * 2 * d * param_bytes  # LAYER_NORM = 2
+    dense_layers_per_gpu = layers_per_gpu - moe_layers_per_gpu
+    dense_ffn_mem = dense_layers_per_gpu * 3 * d * variant["dense_ffn"] * param_bytes
+    embed_mem = 2 * vocab * d * param_bytes  # NUM_EMBEDDINGS_TABLES = 2
+
+    # TP shards attention, FFN, expert, and embedding. LN + router replicated.
+    model_mem_bytes = (
+        (attn_mem + routed_mem + shared_mem + dense_ffn_mem + embed_mem) / tp
+        + ln_mem + router_mem
+    )
+    return model_mem_bytes / 1e9
+
+
 def phase1_memory(variants, hardware, config):
-    """
-    Compute per-GPU memory breakdown for every (variant, hardware, ZeRO, micro) combo.
-    Returns list of result dicts.
-    """
+    """Compute per-GPU memory breakdown with MoE fixes, VP overhead, and fragmentation."""
     results = []
     precision = config.get("PRECISION", "BF16")
     param_bytes = get_param_bytes(precision)
@@ -66,7 +101,9 @@ def phase1_memory(variants, hardware, config):
     tp = config.get("TP", 1)
     cp = config.get("CP", 1)
     ep = config.get("EP", 1)
+    vp = config.get("VP", 1)
     n_experts = config.get("N_EXPERTS", 0)
+    topk = config.get("TOPK", 0)
     vocab = config.get("VOCAB", 128256)
 
     adv = {**ADVANCED_DEFAULTS, **config.get("advanced", {})}
@@ -74,96 +111,116 @@ def phase1_memory(variants, hardware, config):
     act_mult = adv["EMPIRICAL_ACT_MULTIPLIER"]
     act_ckpt_mult = adv["SELECTIVE_ACT_CHECKPOINTING_MULTIPLIER"]
     nccl_buf = adv["NCCL_MEM_BUF"]
+    nccl_ep_scaling = adv["NCCL_EP_SCALING_FACTOR"]
+    frag_factor = adv["FRAGMENTATION_FACTOR"]
     util_threshold = adv["GPU_MEM_UTILIZATION_THRESHOLD"]
     micros = adv["MICROS"]
     zero_strategies = adv["ZERO_STRATEGY"]
+    fwd_bwd_passes = adv["FWD_BWD_ROUTING_BUFF_PASSES"]
 
     for variant in variants:
         layers = variant["layers"]
         d = variant["d"]
         layers_per_gpu = layers // pp
-
-        # Model parameter memory components
-        attn_per_layer = variant["attn_per_layer"]
-        dense_layer_params = variant["dense_layer_params"]
-        moe_layer_params = variant.get("moe_layer_params", 0)
-        dense_layers = variant.get("dense_layers", layers)
-        moe_layers = layers - dense_layers
-
-        # Embedding parameters
-        embed_params = vocab * d * adv["NUM_EMBEDDINGS_TABLES"]
-
-        # Layer norm + router (small, replicated across TP)
-        ln_params = d * adv["LAYER_NORM"] * layers
-        router_total = variant.get("router_each", 0) * moe_layers
+        is_moe = variant.get("expert_ffn", 0) > 0
+        moe_layers = layers - variant.get("dense_layers", layers)
+        moe_layers_per_gpu = int(layers_per_gpu * moe_layers / layers) if layers > 0 and moe_layers > 0 else 0
+        dense_layers_on_gpu = layers_per_gpu - moe_layers_per_gpu
+        experts_per_gpu = n_experts // ep if ep > 0 and n_experts > 0 else 0
 
         for hw in hardware:
             gpus = hw["gpus"]
             gpu_mem = hw["mem_gb"]
             usable_mem = gpu_mem * util_threshold
-            gpus_per_node = gpus // hw.get("nodes", gpus // 8)
+            nodes = hw.get("nodes", gpus // 8)
 
             dp = gpus // (tp * pp * cp)
+
+            # Model memory
+            model_mem_gb = calculate_model_memory_gb(
+                variant, layers_per_gpu, experts_per_gpu, param_bytes, vocab, tp
+            )
 
             for zero_cfg in zero_strategies:
                 zero_stage = zero_cfg["zero"]
 
-                # Layers per GPU split between dense and MoE
-                dense_layers_per_gpu = min(dense_layers, layers_per_gpu)
-                moe_layers_per_gpu = layers_per_gpu - dense_layers_per_gpu
-
-                # Attention + FFN sharded by TP
-                model_params_dense = (dense_layer_params * dense_layers_per_gpu) / tp
-
-                # MoE layer: attention/TP + experts/EP
-                expert_each = variant.get("expert_each", 0)
-                shared_each = variant.get("shared_each", 0)
-                if moe_layers_per_gpu > 0 and n_experts > 0:
-                    experts_per_gpu = n_experts // ep
-                    moe_attn = attn_per_layer * moe_layers_per_gpu / tp
-                    moe_expert = (expert_each * experts_per_gpu + shared_each) * moe_layers_per_gpu
-                    model_params_moe = moe_attn + moe_expert
+                # --- EP/DP optimizer sharding fix ---
+                if is_moe and ep > 1 and dp > ep:
+                    eff_dp_moe = dp // ep
                 else:
-                    model_params_moe = 0
+                    eff_dp_moe = dp
 
-                # Embeddings sharded by TP
-                embed_per_gpu = embed_params / tp
-
-                # LN + router replicated (small)
-                ln_router_per_gpu = (ln_params + router_total) / pp
-
-                total_model_params = model_params_dense + model_params_moe + embed_per_gpu + ln_router_per_gpu
-
-                # ZeRO-3 further shards model params by DP
-                if zero_stage == 3:
-                    total_model_params /= dp
-
-                model_mem_gb = (total_model_params * param_bytes) / (1024**3)
+                # MoE fraction for optimizer splitting
+                if is_moe and model_mem_gb > 0:
+                    routed_mem_bytes = experts_per_gpu * moe_layers_per_gpu * variant["expert_each"] * param_bytes
+                    total_model_bytes = model_mem_gb * 1e9
+                    moe_frac = min(1.0, routed_mem_bytes / total_model_bytes) if total_model_bytes > 0 else 0
+                else:
+                    moe_frac = 0.0
+                dense_frac = 1.0 - moe_frac
 
                 # Gradient memory
                 if zero_stage >= 2:
-                    grad_mem_gb = (total_model_params * param_bytes) / dp / (1024**3)
+                    grad_mem_gb = model_mem_gb / dp
                 else:
                     grad_mem_gb = model_mem_gb
 
-                # Optimizer memory (always sharded by DP for all ZeRO stages)
-                if zero_stage == 3:
-                    base_params_for_optim = (model_params_dense + model_params_moe + embed_per_gpu + ln_router_per_gpu)
-                    optim_mem_gb = (base_params_for_optim * optim_bytes) / dp / (1024**3)
-                else:
-                    optim_mem_gb = (total_model_params * optim_bytes) / dp / (1024**3)
+                # Optimizer memory (dense sharded by full DP, MoE by eff_dp_moe)
+                optim_dense = model_mem_gb * dense_frac * optim_bytes / dp
+                optim_moe = model_mem_gb * moe_frac * optim_bytes / eff_dp_moe
+                optim_mem_gb = optim_dense + optim_moe
 
                 for micro in micros:
-                    # Activation memory
-                    act_mem_gb = (seq_len * micro * d * act_mult * layers_per_gpu * act_ckpt_mult) / (1024**3)
+                    # --- MoE-aware activation memory ---
+                    if is_moe and moe_layers_per_gpu > 0:
+                        expert_ffn = variant.get("expert_ffn", 0)
+                        moe_act_per_layer = seq_len * micro * (d * act_mult + topk * expert_ffn * 2 * param_bytes)
+                        dense_act_per_layer = seq_len * micro * d * act_mult
+                        act_total_full = (moe_layers_per_gpu * moe_act_per_layer +
+                                          dense_layers_on_gpu * dense_act_per_layer)
+                    else:
+                        act_total_full = layers_per_gpu * seq_len * micro * d * act_mult
 
-                    # Communication buffers
-                    buf_mem_gb = nccl_buf
-                    if n_experts > 0 and moe_layers_per_gpu > 0:
-                        routing_buf = (seq_len * micro * d * adv["FWD_BWD_ROUTING_BUFF_PASSES"]) / (1024**3)
-                        buf_mem_gb += routing_buf
+                    act_mem_gb = act_total_full * act_ckpt_mult / 1e9
 
-                    total_mem = model_mem_gb + grad_mem_gb + optim_mem_gb + act_mem_gb + buf_mem_gb
+                    # --- VP activation overhead ---
+                    if vp > 1 and pp > 1:
+                        layers_per_virtual_chunk = layers_per_gpu // vp
+                        inflight_micros = (pp - 1) * vp
+                        if is_moe and moe_layers_per_gpu > 0:
+                            expert_ffn = variant.get("expert_ffn", 0)
+                            avg_act_per_layer = seq_len * micro * (d * act_mult + topk * expert_ffn * 2 * param_bytes)
+                        else:
+                            avg_act_per_layer = seq_len * micro * d * act_mult
+                        vp_overhead = inflight_micros * layers_per_virtual_chunk * avg_act_per_layer / 1e9
+                        act_mem_gb += vp_overhead
+
+                    # --- Buffer memory ---
+                    # All-to-all routing buffers
+                    a2a_buf = seq_len * micro * topk * d * fwd_bwd_passes * param_bytes / 1e9
+
+                    # MoE dispatch buffers
+                    moe_dispatch_buf = 0.0
+                    if is_moe and experts_per_gpu > 0:
+                        moe_dispatch_buf = (
+                            moe_layers_per_gpu * 2 * micro * seq_len * d * param_bytes
+                            * (topk / experts_per_gpu) / 1e9
+                        )
+
+                    # NCCL workspace: base + EP scaling
+                    nccl_workspace = nccl_buf + nccl_ep_scaling * max(0, ep - 1)
+
+                    # PP send/recv buffers
+                    pp_buf = 0.0
+                    if pp > 1:
+                        pp_buf = 2 * micro * seq_len * d * param_bytes / 1e9
+
+                    buf_mem_gb = a2a_buf + moe_dispatch_buf + nccl_workspace + pp_buf
+
+                    # --- Total with fragmentation ---
+                    raw_total = model_mem_gb + grad_mem_gb + optim_mem_gb + act_mem_gb + buf_mem_gb
+                    total_mem = raw_total * frag_factor
+
                     headroom = usable_mem - total_mem
                     fits = headroom > 0
                     utilization = (total_mem / gpu_mem) * 100
@@ -212,16 +269,10 @@ def find_best_memory_config(phase1_results):
 # ============================================================================
 
 def phase2_batch(variants, hardware, config, best_memory):
-    """
-    Sweep micro batch x grad accumulation to find optimal batch configs.
-    Returns list of result dicts.
-    """
+    """Sweep micro batch x grad accumulation to find optimal batch configs."""
     results = []
     seq_len = config.get("SEQ_LEN", 4096)
     total_tokens = config.get("TOTAL_TOKENS", 15e12)
-    tp = config.get("TP", 1)
-    pp = config.get("PP", 1)
-    cp = config.get("CP", 1)
 
     adv = {**ADVANCED_DEFAULTS, **config.get("advanced", {})}
     grad_accums = adv["GRAD_ACCUM_VALUES"]
@@ -279,10 +330,7 @@ def phase2_batch(variants, hardware, config, best_memory):
 # ============================================================================
 
 def phase3_training_time(variants, hardware, config):
-    """
-    Estimate wall-clock training time.
-    Returns list of result dicts.
-    """
+    """Estimate wall-clock training time."""
     results = []
     total_tokens = config.get("TOTAL_TOKENS", 15e12)
     mfu = config.get("MFU", 0.40)
@@ -338,10 +386,7 @@ def phase3_training_time(variants, hardware, config):
 # ============================================================================
 
 def phase4_zero_comm(variants, hardware, config):
-    """
-    Compute ZeRO-1 (all-gather) and ZeRO-2 (reduce-scatter) communication overhead.
-    Returns list of result dicts.
-    """
+    """Compute ZeRO-1 (all-gather) and ZeRO-2 (reduce-scatter) communication overhead."""
     results = []
     precision = config.get("PRECISION", "BF16")
     param_bytes = get_param_bytes(precision)
@@ -355,6 +400,7 @@ def phase4_zero_comm(variants, hardware, config):
         layers = variant["layers"]
         layers_per_gpu = layers // pp
         dense_layers = variant.get("dense_layers", layers)
+        moe_layers = layers - dense_layers
 
         dense_layers_per_gpu = min(dense_layers, layers_per_gpu)
         moe_layers_per_gpu = layers_per_gpu - dense_layers_per_gpu
@@ -401,10 +447,7 @@ def phase4_zero_comm(variants, hardware, config):
 # ============================================================================
 
 def phase5_alltoall(variants, hardware, config):
-    """
-    Compute MoE all-to-all routing communication overhead.
-    Returns list of result dicts (empty for dense models).
-    """
+    """Compute MoE all-to-all routing communication overhead."""
     results = []
     n_experts = config.get("N_EXPERTS", 0)
     ep = config.get("EP", 1)
@@ -452,12 +495,108 @@ def phase5_alltoall(variants, hardware, config):
 
 
 # ============================================================================
+# PHASE 6: PP SendRecv Communication (NEW)
+# ============================================================================
+
+def phase6_pp_comm(variants, hardware, config):
+    """
+    Compute PP point-to-point communication overhead.
+    Models intra-node (NVLink) vs inter-node (EFA) latency.
+    """
+    results = []
+    pp = config.get("PP", 1)
+    vp = config.get("VP", 1)
+    tp = config.get("TP", 1)
+    cp = config.get("CP", 1)
+    ep = config.get("EP", 1)
+    seq_len = config.get("SEQ_LEN", 4096)
+    precision = config.get("PRECISION", "BF16")
+    dtype_bytes = get_param_bytes(precision)
+    total_tokens = config.get("TOTAL_TOKENS", 15e12)
+
+    if pp <= 1:
+        return results
+
+    adv = {**ADVANCED_DEFAULTS, **config.get("advanced", {})}
+    efa_pp_eff = adv["EFA_PP_EFFICIENCY"]
+    micros = adv["MICROS"]
+
+    for variant in variants:
+        layers = variant["layers"]
+        d = variant["d"]
+
+        for hw in hardware:
+            gpus = hw["gpus"]
+            inter_bw = hw["inter_node_bw_gb"]
+            intra_bw = hw["intra_node_bw_gbps"]
+            gpus_per_node = gpus // hw.get("nodes", gpus // 8)
+            dp = gpus // (tp * pp * cp)
+
+            # Determine if PP crosses node boundary
+            is_inter_node = pp > gpus_per_node
+            comm_type = "inter-node (EFA)" if is_inter_node else "intra-node (NVLink)"
+
+            for micro in micros:
+                # Activation size per P2P send
+                activation_size_bytes = micro * seq_len * d * dtype_bytes
+                activation_size_mb = activation_size_bytes / 1e6
+
+                # Sends per micro-batch
+                if vp > 1:
+                    sends_per_microbatch = 2 * (pp * vp - 1)
+                else:
+                    sends_per_microbatch = 2 * (pp - 1)
+
+                # GBS approximation for tokens_per_batch / seq_len
+                tokens_per_batch = adv["TOKENS_PER_BATCH"]
+                gbs = int(tokens_per_batch / seq_len)
+                num_microbatches = gbs // (micro * dp) if (micro * dp) > 0 else 1
+
+                # Total sends and traffic
+                total_sends = sends_per_microbatch * num_microbatches
+                total_traffic_gb = total_sends * activation_size_bytes / 1e9
+
+                # Pipeline bubble
+                effective_microbatches = num_microbatches * vp if vp > 1 else num_microbatches
+                bubble_pct = ((pp - 1) / effective_microbatches * 100
+                              if effective_microbatches > 0 else 100)
+
+                # Time per send
+                if is_inter_node:
+                    effective_bw = inter_bw * efa_pp_eff
+                else:
+                    effective_bw = intra_bw
+                time_per_send_us = (activation_size_bytes / 1e9) / effective_bw * 1e6 if effective_bw > 0 else 0
+
+                # Exposed PP time (warmup + cooldown sends)
+                exposed_sends = 2 * (pp - 1)
+                estimated_pp_time_ms = exposed_sends * time_per_send_us / 1000
+
+                results.append({
+                    "variant": variant["name"],
+                    "hardware": hw["name"],
+                    "micro_batch": micro,
+                    "activation_size_mb": round(activation_size_mb, 2),
+                    "sends_per_microbatch": sends_per_microbatch,
+                    "num_microbatches": num_microbatches,
+                    "total_sends_per_step": total_sends,
+                    "total_traffic_gb": round(total_traffic_gb, 3),
+                    "pipeline_bubble_pct": round(bubble_pct, 1),
+                    "time_per_send_us": round(time_per_send_us, 1),
+                    "estimated_pp_time_ms": round(estimated_pp_time_ms, 2),
+                    "comm_type": comm_type,
+                })
+
+    return results
+
+
+# ============================================================================
 # MAIN ORCHESTRATOR
 # ============================================================================
 
 def run_calculator(variants, hardware, config, output_dir=None):
     """
-    Run all 5 phases and return structured results.
+    Run all 6 phases and return structured results.
 
     Args:
         variants: list of model variant dicts
@@ -466,7 +605,7 @@ def run_calculator(variants, hardware, config, output_dir=None):
         output_dir: optional directory to write CSV exports
 
     Returns:
-        dict with phase1-phase5 results
+        dict with phase1-phase6 results
     """
     # Phase 1: Memory
     p1 = phase1_memory(variants, hardware, config)
@@ -484,6 +623,9 @@ def run_calculator(variants, hardware, config, output_dir=None):
     # Phase 5: MoE All-to-All
     p5 = phase5_alltoall(variants, hardware, config)
 
+    # Phase 6: PP SendRecv Communication
+    p6 = phase6_pp_comm(variants, hardware, config)
+
     results = {
         "phase1_memory": p1,
         "phase1_best": {k[0] + "|" + k[1]: v for k, v in best_mem.items()},
@@ -491,6 +633,7 @@ def run_calculator(variants, hardware, config, output_dir=None):
         "phase3_training_time": p3,
         "phase4_zero_comm": p4,
         "phase5_alltoall": p5,
+        "phase6_pp_comm": p6,
     }
 
     # Export CSVs if output_dir specified
@@ -507,6 +650,8 @@ def run_calculator(variants, hardware, config, output_dir=None):
             _write_csv(os.path.join(output_dir, "phase4_zero_comm_results.csv"), p4)
         if p5:
             _write_csv(os.path.join(output_dir, "phase5_alltoall_results.csv"), p5)
+        if p6:
+            _write_csv(os.path.join(output_dir, "phase6_pp_comm_results.csv"), p6)
 
         # JSON export for Phase 1
         with open(os.path.join(output_dir, "phase1_memory_results.json"), "w") as f:
