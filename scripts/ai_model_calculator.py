@@ -55,6 +55,10 @@ ADVANCED_DEFAULTS = {
     # Fraction of MoE all-to-all comm NOT overlapped with compute (Phase 3
     # exposed-comm term). 0.0 = fully overlapped, 1.0 = fully exposed.
     "A2A_EXPOSED_FRACTION": 0.5,
+    # Attention FLOPs factor for the O(seq_len^2) attention term in training
+    # time. 6ND omits the QK^T and softmax*V matmuls (O(seq_len^2 * d)/layer);
+    # 12 = forward ~4 (2 matmuls * 2 FLOPs/MAC) x3 for fwd+bwd. 0 disables.
+    "ATTENTION_FLOPS_FACTOR": 12,
 }
 
 
@@ -99,7 +103,7 @@ def phase1_memory(variants, hardware, config):
     results = []
     precision = config.get("PRECISION", "BF16")
     param_bytes = get_param_bytes(precision)
-    seq_len = config.get("SEQ_LEN", 4096)
+    default_seq_len = config.get("SEQ_LEN", 4096)
     pp = config.get("PP", 1)
     tp = config.get("TP", 1)
     cp = config.get("CP", 1)
@@ -124,6 +128,7 @@ def phase1_memory(variants, hardware, config):
     for variant in variants:
         layers = variant["layers"]
         d = variant["d"]
+        seq_len = variant.get("seq_len", default_seq_len)
         layers_per_gpu = layers // pp
         is_moe = variant.get("expert_ffn", 0) > 0
         moe_layers = layers - variant.get("dense_layers", layers)
@@ -274,13 +279,14 @@ def find_best_memory_config(phase1_results):
 def phase2_batch(variants, hardware, config, best_memory):
     """Sweep micro batch x grad accumulation to find optimal batch configs."""
     results = []
-    seq_len = config.get("SEQ_LEN", 4096)
+    default_seq_len = config.get("SEQ_LEN", 4096)
     total_tokens = config.get("TOTAL_TOKENS", 15e12)
 
     adv = {**ADVANCED_DEFAULTS, **config.get("advanced", {})}
     grad_accums = adv["GRAD_ACCUM_VALUES"]
 
     for variant in variants:
+        seq_len = variant.get("seq_len", default_seq_len)
         for hw in hardware:
             key = (variant["name"], hw["name"])
             if key not in best_memory:
@@ -345,7 +351,7 @@ def _phase3_overhead(variant, hw, config, adv, micro, gbs, dp):
     vp = config.get("VP", 1)
     ep = config.get("EP", 1)
     n_experts = config.get("N_EXPERTS", 0)
-    seq_len = config.get("SEQ_LEN", 4096)
+    seq_len = variant.get("seq_len", config.get("SEQ_LEN", 4096))
     d = variant["d"]
     dtype_bytes = get_param_bytes(config.get("PRECISION", "BF16"))
 
@@ -410,13 +416,23 @@ def phase3_training_time(variants, hardware, config, best_memory):
     high_mult = adv["TIME_ESTIMATE_HIGH_MULTIPLIER"]
     grad_accums = adv["GRAD_ACCUM_VALUES"]
     max_tokens_per_batch = adv["MAX_TOKENS_PER_BATCH"]
+    attn_factor = adv["ATTENTION_FLOPS_FACTOR"]
     zero_eff_map = {z["zero"]: z["eff"] for z in adv["ZERO_STRATEGY"]}
     _SECONDS_PER_MONTH = 86400 * 30.44
 
     for variant in variants:
         active_params = variant["active_params_B"]
-        flops_per_token = 6 * active_params * 1e9
-        total_flops = flops_per_token * total_tokens
+        # Per-variant sequence length (falls back to the global default).
+        v_seq_len = variant.get("seq_len", seq_len)
+        # Linear-in-tokens compute (6ND) + O(seq_len^2) attention term. The
+        # attention term is linear in seq_len at fixed total_tokens, so a 32K
+        # context estimates more compute than a 4K one for the same tokens.
+        linear_flops = 6 * active_params * 1e9 * total_tokens
+        attention_flops = (
+            attn_factor * variant["layers"] * v_seq_len * total_tokens * variant["d"]
+            if attn_factor else 0.0
+        )
+        total_flops = linear_flops + attention_flops
 
         for hw in hardware:
             key = (variant["name"], hw["name"])
@@ -437,7 +453,7 @@ def phase3_training_time(variants, hardware, config, best_memory):
             for micro in range(1, max_micro + 1):
                 for accum in grad_accums:
                     gbs = dp * micro * accum
-                    tokens_per_batch = gbs * seq_len
+                    tokens_per_batch = gbs * v_seq_len
                     if tokens_per_batch > max_tokens_per_batch:
                         continue
                     steps = int(total_tokens / tokens_per_batch) if tokens_per_batch > 0 else 0
@@ -554,7 +570,7 @@ def phase5_alltoall(variants, hardware, config):
     results = []
     n_experts = config.get("N_EXPERTS", 0)
     ep = config.get("EP", 1)
-    seq_len = config.get("SEQ_LEN", 4096)
+    default_seq_len = config.get("SEQ_LEN", 4096)
 
     if n_experts == 0 or ep <= 1:
         return results
@@ -569,6 +585,7 @@ def phase5_alltoall(variants, hardware, config):
 
         d = variant["d"]
         layers = variant["layers"]
+        seq_len = variant.get("seq_len", default_seq_len)
         dense_layers = variant.get("dense_layers", 0)
         moe_layers = layers - dense_layers
 
@@ -612,7 +629,7 @@ def phase6_pp_comm(variants, hardware, config):
     tp = config.get("TP", 1)
     cp = config.get("CP", 1)
     ep = config.get("EP", 1)
-    seq_len = config.get("SEQ_LEN", 4096)
+    default_seq_len = config.get("SEQ_LEN", 4096)
     precision = config.get("PRECISION", "BF16")
     dtype_bytes = get_param_bytes(precision)
     total_tokens = config.get("TOTAL_TOKENS", 15e12)
@@ -627,6 +644,7 @@ def phase6_pp_comm(variants, hardware, config):
     for variant in variants:
         layers = variant["layers"]
         d = variant["d"]
+        seq_len = variant.get("seq_len", default_seq_len)
 
         for hw in hardware:
             gpus = hw["gpus"]
