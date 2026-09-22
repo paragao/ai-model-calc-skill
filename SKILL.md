@@ -182,7 +182,7 @@ The script exports CSVs to the output_dir automatically.
 **All modes include:**
 - Phase 1: Memory breakdown table (model, gradient, optimizer, activation, buffer, total, headroom)
 - Phase 2: Top 3-5 batch configurations (micro batch, grad accum, tokens/batch, steps, assessment)
-- Phase 3: Training time estimates with confidence range
+- Phase 3: Training time over the micro × gradient-accumulation grid — global batch size (GBS), tokens/batch, steps, PP bubble %, exposed comm %, and time estimate with confidence range
 - Phase 4: ZeRO communication overhead
 - Phase 5: MoE all-to-all routing (skip for dense models)
 - Phase 6: PP SendRecv communication — intra-node (NVLink) vs inter-node (EFA) latency comparison, bubble %, exposed overhead
@@ -208,12 +208,27 @@ Only generate if user explicitly requests an HTML report.
 - Fragmentation factor: `1.24×` (empirical PyTorch caching allocator overhead)
 - Usable threshold: `GPU_MEM * 0.92`
 
-### Phase 3: Training Time
-- `flops_per_token = 6 * active_params_B * 1e9`
-- `total_flops = flops_per_token * TOTAL_TOKENS`
-- `effective_tflops = peak_tflops * MFU * zero_efficiency`
-- `time_seconds = total_flops / (gpus * effective_tflops * 1e12)`
-- Range: `[time * 0.75, time * 1.25]`
+### Phase 3: Training Time (grid sweep + overhead-aware)
+Gradient accumulation is a **user-controlled input** (it changes the optimizer-update
+frequency and therefore convergence/perplexity), so Phase 3 **sweeps** the full
+`micro × GRAD_ACCUM_VALUES` grid rather than deriving accum from a target batch.
+Each (variant, hardware) uses the **single best-fit ZeRO stage** from Phase 1.
+
+Per (micro, accum) config:
+- `gbs = dp * micro * accum` (global batch in sequences), `tokens_per_batch = gbs * SEQ_LEN`
+  (skip if `> MAX_TOKENS_PER_BATCH`), `steps = TOTAL_TOKENS / tokens_per_batch`
+- Ideal compute: `flops_per_token = 6 * active_params_B * 1e9`;
+  `compute_seconds = (flops_per_token * TOTAL_TOKENS) / (gpus * peak_tflops * MFU * zero_eff * 1e12)`
+- **PP bubble** (idle pipeline) inflates compute: `bubble_seconds = compute_seconds * bf/(1-bf)`,
+  where `bf = (PP-1)/effective_microbatches` (0 when PP=1). Larger accum → more
+  micro-batches → smaller bubble.
+- **Exposed comm** (absolute, not overlapped): `comm_seconds = (exposed_ms_per_step / 1000) * steps`,
+  where `exposed_ms_per_step = PP exposed-send ms (Phase 6) + A2A_EXPOSED_FRACTION × MoE all-to-all ms/step (Phase 5)`
+- `total_seconds = compute + bubble + comm`; reported as time_days/time_months with
+  range `[×0.75, ×1.25]`, plus `bubble_pct` and `comm_overhead_pct` of total.
+- `A2A_EXPOSED_FRACTION` (default 0.5) controls how much MoE all-to-all is exposed.
+- Reduces exactly to the FLOPs-only estimate when bubble and exposed comm are 0
+  (e.g. dense model at PP=1).
 
 ### Phase 6: PP SendRecv Communication (NEW)
 - Activation size per send: `micro * seq_len * d * dtype_bytes`

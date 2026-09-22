@@ -28,7 +28,7 @@ ADVANCED_DEFAULTS = {
         {"zero": 3, "eff": 0.8},
     ],
     "MICROS": [1, 2, 4, 8, 16],
-    "GRAD_ACCUM_VALUES": [4, 8, 16, 32, 64, 128],
+    "GRAD_ACCUM_VALUES": [1, 2, 4, 8, 16, 32],
     "LAYER_NORM": 2,
     "FFN_WEIGHT_MATRICES": 3,
     "NUM_EMBEDDINGS_TABLES": 2,
@@ -52,6 +52,9 @@ ADVANCED_DEFAULTS = {
     "TIME_ESTIMATE_LOW_MULTIPLIER": 0.75,
     "TIME_ESTIMATE_HIGH_MULTIPLIER": 1.25,
     "EFA_PP_EFFICIENCY": 0.016,
+    # Fraction of MoE all-to-all comm NOT overlapped with compute (Phase 3
+    # exposed-comm term). 0.0 = fully overlapped, 1.0 = fully exposed.
+    "A2A_EXPOSED_FRACTION": 0.5,
 }
 
 
@@ -329,16 +332,86 @@ def phase2_batch(variants, hardware, config, best_memory):
 # PHASE 3: Training Time
 # ============================================================================
 
-def phase3_training_time(variants, hardware, config):
-    """Estimate wall-clock training time."""
+def _phase3_overhead(variant, hw, config, adv, micro, gbs, dp):
+    """Estimate PP bubble fraction and exposed comm ms/step for one config.
+
+    Mirrors the Phase 6 (PP send/recv) and Phase 5 (MoE all-to-all) models so
+    the overhead varies with the swept micro/accum (via gbs -> num_microbatches).
+
+    Returns:
+        (bubble_fraction, exposed_comm_ms_per_step)
+    """
+    pp = config.get("PP", 1)
+    vp = config.get("VP", 1)
+    ep = config.get("EP", 1)
+    n_experts = config.get("N_EXPERTS", 0)
+    seq_len = config.get("SEQ_LEN", 4096)
+    d = variant["d"]
+    dtype_bytes = get_param_bytes(config.get("PRECISION", "BF16"))
+
+    num_microbatches = gbs // (micro * dp) if (micro * dp) > 0 else 1
+
+    bubble_fraction = 0.0
+    exposed_comm_ms = 0.0
+
+    # --- Pipeline bubble + exposed PP send time (PP > 1) ---
+    if pp > 1:
+        effective_microbatches = num_microbatches * vp if vp > 1 else num_microbatches
+        bubble_pct = ((pp - 1) / effective_microbatches * 100
+                      if effective_microbatches > 0 else 100)
+        bubble_fraction = min(0.99, bubble_pct / 100.0)
+
+        gpus_per_node = hw["gpus"] // hw.get("nodes", max(1, hw["gpus"] // 8))
+        is_inter_node = pp > gpus_per_node
+        if is_inter_node:
+            effective_bw = hw["inter_node_bw_gb"] * adv["EFA_PP_EFFICIENCY"]
+        else:
+            effective_bw = hw["intra_node_bw_gbps"]
+        activation_size_bytes = micro * seq_len * d * dtype_bytes
+        time_per_send_us = (
+            (activation_size_bytes / 1e9) / effective_bw * 1e6 if effective_bw > 0 else 0
+        )
+        exposed_sends = 2 * (pp - 1)  # warmup + cooldown (serialized)
+        exposed_comm_ms += exposed_sends * time_per_send_us / 1000
+
+    # --- Exposed MoE all-to-all (MoE only) ---
+    if n_experts > 0 and ep > 1 and variant.get("expert_ffn", 0) > 0:
+        moe_layers = variant["layers"] - variant.get("dense_layers", 0)
+        fwd_bwd_passes = adv["FWD_BWD_ROUTING_BUFF_PASSES"]
+        intra_bw = hw["intra_node_bw_gbps"]
+        tokens_per_micro = seq_len * micro
+        volume_per_layer_gb = (tokens_per_micro * d * 2 * fwd_bwd_passes) / (1024 ** 3)
+        # a2a ms per micro-batch across MoE layers, times micro-batches per step
+        a2a_per_microbatch_ms = (
+            (volume_per_layer_gb * moe_layers) / intra_bw * 1000 if intra_bw > 0 else 0
+        )
+        a2a_per_step_ms = a2a_per_microbatch_ms * num_microbatches
+        exposed_comm_ms += adv["A2A_EXPOSED_FRACTION"] * a2a_per_step_ms
+
+    return bubble_fraction, exposed_comm_ms
+
+
+def phase3_training_time(variants, hardware, config, best_memory):
+    """Estimate wall-clock training time over the micro x grad-accum grid.
+
+    Gradient accumulation is an explicit user-controlled input (it affects
+    convergence/perplexity), so GRAD_ACCUM_VALUES is swept rather than derived.
+    Uses the single best-fit ZeRO stage per (variant, hardware) from Phase 1,
+    and folds PP pipeline-bubble + exposed communication into the wall-clock
+    time on top of the ideal FLOPs compute time.
+    """
     results = []
     total_tokens = config.get("TOTAL_TOKENS", 15e12)
     mfu = config.get("MFU", 0.40)
+    seq_len = config.get("SEQ_LEN", 4096)
 
     adv = {**ADVANCED_DEFAULTS, **config.get("advanced", {})}
     low_mult = adv["TIME_ESTIMATE_LOW_MULTIPLIER"]
     high_mult = adv["TIME_ESTIMATE_HIGH_MULTIPLIER"]
-    zero_strategies = adv["ZERO_STRATEGY"]
+    grad_accums = adv["GRAD_ACCUM_VALUES"]
+    max_tokens_per_batch = adv["MAX_TOKENS_PER_BATCH"]
+    zero_eff_map = {z["zero"]: z["eff"] for z in adv["ZERO_STRATEGY"]}
+    _SECONDS_PER_MONTH = 86400 * 30.44
 
     for variant in variants:
         active_params = variant["active_params_B"]
@@ -346,37 +419,67 @@ def phase3_training_time(variants, hardware, config):
         total_flops = flops_per_token * total_tokens
 
         for hw in hardware:
+            key = (variant["name"], hw["name"])
+            if key not in best_memory:
+                continue  # OOM on all configs for this variant/hardware
+
+            best = best_memory[key]
+            zero_stage = best["zero_stage"]
+            zero_eff = zero_eff_map.get(zero_stage, 1.0)
+            max_micro = best["micro_batch"]
+            dp = best["dp"]
+
             gpus = hw["gpus"]
             peak_tflops = hw["peak_tflops_bf16"]
+            effective_tflops = peak_tflops * mfu * zero_eff
+            compute_seconds = total_flops / (gpus * effective_tflops * 1e12)
 
-            for zero_cfg in zero_strategies:
-                zero_stage = zero_cfg["zero"]
-                zero_eff = zero_cfg["eff"]
+            for micro in range(1, max_micro + 1):
+                for accum in grad_accums:
+                    gbs = dp * micro * accum
+                    tokens_per_batch = gbs * seq_len
+                    if tokens_per_batch > max_tokens_per_batch:
+                        continue
+                    steps = int(total_tokens / tokens_per_batch) if tokens_per_batch > 0 else 0
 
-                effective_tflops = peak_tflops * mfu * zero_eff
-                time_seconds = total_flops / (gpus * effective_tflops * 1e12)
+                    # Overhead: PP bubble (fraction of compute) + exposed comm (ms/step)
+                    bubble_fraction, exposed_comm_ms = _phase3_overhead(
+                        variant, hw, config, adv, micro, gbs, dp
+                    )
+                    bubble_seconds = (
+                        compute_seconds * bubble_fraction / (1.0 - bubble_fraction)
+                        if bubble_fraction > 0 else 0.0
+                    )
+                    comm_seconds = (exposed_comm_ms / 1000.0) * steps
+                    total_seconds = compute_seconds + bubble_seconds + comm_seconds
 
-                time_days = time_seconds / 86400
-                time_low = time_days * low_mult
-                time_high = time_days * high_mult
-                time_months = time_days / 30.44
+                    time_days = total_seconds / 86400
+                    time_months = total_seconds / _SECONDS_PER_MONTH
+                    bubble_pct = (bubble_seconds / total_seconds * 100) if total_seconds > 0 else 0.0
+                    comm_pct = (comm_seconds / total_seconds * 100) if total_seconds > 0 else 0.0
 
-                results.append({
-                    "variant": variant["name"],
-                    "hardware": hw["name"],
-                    "gpus": gpus,
-                    "zero_stage": zero_stage,
-                    "zero_efficiency": zero_eff,
-                    "time_seconds": round(time_seconds, 1),
-                    "time_days": round(time_days, 2),
-                    "time_days_low": round(time_low, 2),
-                    "time_days_high": round(time_high, 2),
-                    "time_months": round(time_months, 2),
-                    "time_months_low": round(time_months * low_mult, 2),
-                    "time_months_high": round(time_months * high_mult, 2),
-                    "effective_tflops_per_gpu": round(effective_tflops, 1),
-                    "total_pflops": round(gpus * effective_tflops / 1000, 1),
-                })
+                    results.append({
+                        "variant": variant["name"],
+                        "hardware": hw["name"],
+                        "gpus": gpus,
+                        "zero_stage": zero_stage,
+                        "zero_efficiency": zero_eff,
+                        "micro_batch": micro,
+                        "grad_accum": accum,
+                        "gbs": gbs,
+                        "tokens_per_batch": tokens_per_batch,
+                        "training_steps": steps,
+                        "time_days": round(time_days, 2),
+                        "time_days_low": round(time_days * low_mult, 2),
+                        "time_days_high": round(time_days * high_mult, 2),
+                        "time_months": round(time_months, 2),
+                        "time_months_low": round(time_months * low_mult, 2),
+                        "time_months_high": round(time_months * high_mult, 2),
+                        "bubble_pct": round(bubble_pct, 1),
+                        "comm_overhead_pct": round(comm_pct, 1),
+                        "effective_tflops_per_gpu": round(effective_tflops, 1),
+                        "total_pflops": round(gpus * effective_tflops / 1000, 1),
+                    })
 
     return results
 
@@ -615,7 +718,7 @@ def run_calculator(variants, hardware, config, output_dir=None):
     p2 = phase2_batch(variants, hardware, config, best_mem)
 
     # Phase 3: Training Time
-    p3 = phase3_training_time(variants, hardware, config)
+    p3 = phase3_training_time(variants, hardware, config, best_mem)
 
     # Phase 4: ZeRO Communication
     p4 = phase4_zero_comm(variants, hardware, config)
