@@ -35,9 +35,9 @@ scripts: [ai_model_calculator.py]
 
 ## Overview
 
-This skill runs a 5-phase LLM training infrastructure calculator that computes GPU memory requirements, optimal batch configurations, wall-clock training time estimates, and communication overhead (ZeRO + MoE all-to-all) for large language models on AWS GPU instances. It supports dense and MoE architectures across p5 (H100), p5en (H200), p6-b200 (B200), p6-b300 (B300 Ultra), p6e-gb200 (GB200 NVL), and G-family instances.
+This skill runs a 6-phase LLM training infrastructure calculator that computes GPU memory requirements, optimal batch configurations, wall-clock training time estimates, and communication overhead (ZeRO, MoE all-to-all, and PP SendRecv) for large language models on AWS GPU instances. It supports dense and MoE architectures across p5 (H100), p5en (H200), p6-b200 (B200), p6-b300 (B300 Ultra), p6e-gb200 (GB200 NVL), and G-family instances.
 
-The calculator is **fully self-contained and portable** — no git clone, no subprocess, no external dependencies, no hardcoded paths. The bundled `ai_model_calculator.py` script is auto-imported when the skill loads. Works on any platform (macOS, Windows, Linux) for any user. Simply `from ai_model_calculator import run_calculator`.
+The calculator is **fully self-contained and portable** — no git clone, no subprocess, no external dependencies, no hardcoded paths. The bundled `ai_model_calculator.py` script is auto-imported when the skill loads. Works on any platform (macOS, Windows, Linux) for any user. Simply `from ai_model_calculator import run_calculator`. Includes MoE-aware memory estimation with dispatch buffers, fragmentation factor (1.24×), VP activation overhead, and EP/DP optimizer sharding.
 
 ## Supported Models
 
@@ -127,7 +127,7 @@ Apply smart defaults automatically based on model family:
 
 Other defaults: SEQ_LEN=4096, PP=1, TP=1, CP=1, PRECISION="BF16", MFU=0.40, TOKENS_PER_BATCH=4e6
 
-**Important**: For large models (>70B dense params), TP=8 is typically needed (one full node). Check Phase 1 memory fit — if OOM with TP=1, retry with TP=8.
+**Important**: For large models (>70B dense params), TP=8 is typically needed (one full node). Check Phase 1 memory fit — if OOM with TP=1, retry with TP=8. For MoE models with PP>1, set VP (Virtual Pipeline Parallelism) — typical values: VP=4 for PP=8, VP=2 for PP=4. VP reduces bubble time but increases activation memory.
 
 ### Step 4: Run Calculator
 - **Mode**: `deterministic`
@@ -153,6 +153,7 @@ config = {         # Merged config from Step 3
     "TP": 8,
     "CP": 1,
     "EP": 1,
+    "VP": 1,
     "TOTAL_TOKENS": 15e12,
     "PRECISION": "BF16",
     "MFU": 0.40,
@@ -181,9 +182,10 @@ The script exports CSVs to the output_dir automatically.
 **All modes include:**
 - Phase 1: Memory breakdown table (model, gradient, optimizer, activation, buffer, total, headroom)
 - Phase 2: Top 3-5 batch configurations (micro batch, grad accum, tokens/batch, steps, assessment)
-- Phase 3: Training time estimates with confidence range
+- Phase 3: Training time over the micro × gradient-accumulation grid — global batch size (GBS), tokens/batch, steps, PP bubble %, exposed comm %, and time estimate with confidence range
 - Phase 4: ZeRO communication overhead
 - Phase 5: MoE all-to-all routing (skip for dense models)
+- Phase 6: PP SendRecv communication — intra-node (NVLink) vs inter-node (EFA) latency comparison, bubble %, exposed overhead
 
 ### Step 6: Generate HTML Report (Optional)
 - **Mode**: `agentic`
@@ -197,19 +199,44 @@ Only generate if user explicitly requests an HTML report.
 ## Calculation Formulas
 
 ### Phase 1: Memory Analysis
-- Model memory: `(attn + FFN + expert + embed) * PARAM_BYTES / (TP * PP)` (ZeRO-3 further divides by DP)
+- Model memory: `(attn + FFN + expert + embed) * PARAM_BYTES / (TP * PP)` (TP shards attn/FFN/expert/embed; LN+router replicated)
 - Gradients: same size as model params; sharded by DP under ZeRO ≥ 2
-- Optimizer: `model_params_per_gpu * 6 bytes`; sharded by DP under all ZeRO stages
-- Activations: `SEQ_LEN * micro * d * 12 * layers_per_gpu * 0.45`
-- Buffers: `4 GB (NCCL)` + MoE routing buffers
+- Optimizer: `model_mem * dense_frac * 6 / dp + model_mem * moe_frac * 6 / eff_dp_moe` (EP/DP sharding fix: eff_dp_moe = dp/ep when dp > ep)
+- Activations: MoE-aware per-layer cost: `seq * micro * (d * 12 + topk * expert_ffn * 2 * param_bytes)` for MoE layers, `seq * micro * d * 12` for dense layers; times `0.45` for selective checkpointing
+- VP activation overhead: `(PP-1) * VP * layers_per_virtual_chunk * avg_act_per_layer` (full non-checkpointed activations for in-flight micro-batches)
+- Buffers: `6 GB (NCCL base)` + `1 GB * (EP-1)` EP scaling + MoE dispatch buffers + PP send/recv buffers
+- Fragmentation factor: `1.24×` (empirical PyTorch caching allocator overhead)
 - Usable threshold: `GPU_MEM * 0.92`
 
-### Phase 3: Training Time
-- `flops_per_token = 6 * active_params_B * 1e9`
-- `total_flops = flops_per_token * TOTAL_TOKENS`
-- `effective_tflops = peak_tflops * MFU * zero_efficiency`
-- `time_seconds = total_flops / (gpus * effective_tflops * 1e12)`
-- Range: `[time * 0.75, time * 1.25]`
+### Phase 3: Training Time (grid sweep + overhead-aware)
+Gradient accumulation is a **user-controlled input** (it changes the optimizer-update
+frequency and therefore convergence/perplexity), so Phase 3 **sweeps** the full
+`micro × GRAD_ACCUM_VALUES` grid rather than deriving accum from a target batch.
+Each (variant, hardware) uses the **single best-fit ZeRO stage** from Phase 1.
+
+Per (micro, accum) config:
+- `gbs = dp * micro * accum` (global batch in sequences), `tokens_per_batch = gbs * SEQ_LEN`
+  (skip if `> MAX_TOKENS_PER_BATCH`), `steps = TOTAL_TOKENS / tokens_per_batch`
+- Ideal compute: `flops_per_token = 6 * active_params_B * 1e9`;
+  `compute_seconds = (flops_per_token * TOTAL_TOKENS) / (gpus * peak_tflops * MFU * zero_eff * 1e12)`
+- **PP bubble** (idle pipeline) inflates compute: `bubble_seconds = compute_seconds * bf/(1-bf)`,
+  where `bf = (PP-1)/effective_microbatches` (0 when PP=1). Larger accum → more
+  micro-batches → smaller bubble.
+- **Exposed comm** (absolute, not overlapped): `comm_seconds = (exposed_ms_per_step / 1000) * steps`,
+  where `exposed_ms_per_step = PP exposed-send ms (Phase 6) + A2A_EXPOSED_FRACTION × MoE all-to-all ms/step (Phase 5)`
+- `total_seconds = compute + bubble + comm`; reported as time_days/time_months with
+  range `[×0.75, ×1.25]`, plus `bubble_pct` and `comm_overhead_pct` of total.
+- `A2A_EXPOSED_FRACTION` (default 0.5) controls how much MoE all-to-all is exposed.
+- Reduces exactly to the FLOPs-only estimate when bubble and exposed comm are 0
+  (e.g. dense model at PP=1).
+
+### Phase 6: PP SendRecv Communication (NEW)
+- Activation size per send: `micro * seq_len * d * dtype_bytes`
+- Sends per micro-batch: `2*(PP*VP - 1)` (interleaved) or `2*(PP-1)` (standard)
+- Intra-node: NVLink bandwidth (e.g., 1800 GB/s for B300) → ~18 µs per send
+- Inter-node: EFA P2P uses only 1-2 of 16 NICs → `EFA_PP_EFFICIENCY = 0.016` → ~5.2 ms per send
+- Pipeline bubble: `(PP-1) / (num_microbatches * VP)` %
+- Exposed time = warmup + cooldown sends: `2*(PP-1) * time_per_send`
 
 ### ZeRO Efficiency
 - ZeRO-1: 1.0 (optimizer states only)

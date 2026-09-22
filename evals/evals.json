@@ -1,0 +1,24 @@
+{
+  "skill_name": "ai-model-calc",
+  "created_at": 1779209419.4511528,
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "Calculate training infrastructure for Llama-3.1-70B on p5en with 15T tokens, 256 nodes \u2014 how long will it take?",
+      "description": "Test case 1",
+      "expected_output": ""
+    },
+    {
+      "id": 2,
+      "prompt": "How many p6-b200 instances do I need to train DeepSeek-V3 on 30B tokens in 2 months?",
+      "description": "Test case 2",
+      "expected_output": ""
+    },
+    {
+      "id": 3,
+      "prompt": "What's the minimum number of p5en instances to fit Llama-3.1-405B in memory?",
+      "description": "Test case 3",
+      "expected_output": ""
+    }
+  ]
+}
